@@ -14,6 +14,7 @@ protocol reimplementation.
 Implement:
 
 - `POST /v1/messages`
+- `POST /v1/messages/count_tokens`
 - optional `GET /v1/models` for Claude Code gateway model discovery
 - non-stream responses with exact Anthropic Messages response shape
 - streamed responses with exact Anthropic SSE event semantics
@@ -46,7 +47,7 @@ DEFAULT_DEEPSEEK_MODEL=deepseek-v4-flash
 CLAUDE_OPUS_MODEL=deepseek-v4-pro
 CLAUDE_SONNET_MODEL=deepseek-v4-flash
 CLAUDE_HAIKU_MODEL=deepseek-v4-flash
-DEEPSEEK_THINKING=enabled
+DEEPSEEK_THINKING=disabled
 DEEPSEEK_REASONING_EFFORT=high
 ```
 

@@ -45,6 +45,7 @@ Claude Code officially supports routing requests through a proxy or gateway with
 The gateway must therefore accept:
 
 - `POST /v1/messages`
+- `POST /v1/messages/count_tokens` if Claude Code requests token counting
 - `GET /v1/models` if needed for model discovery
 - `x-api-key`
 - `authorization: Bearer ...`
@@ -107,7 +108,7 @@ DEFAULT_DEEPSEEK_MODEL=deepseek-v4-flash
 CLAUDE_OPUS_MODEL=deepseek-v4-pro
 CLAUDE_SONNET_MODEL=deepseek-v4-flash
 CLAUDE_HAIKU_MODEL=deepseek-v4-flash
-DEEPSEEK_THINKING=enabled
+DEEPSEEK_THINKING=disabled
 DEEPSEEK_REASONING_EFFORT=high
 ```
 
@@ -218,8 +219,8 @@ not normal assistant text.
 
 Default policy:
 
-- enable DeepSeek thinking mode unless config disables it
-- send configured `reasoning_effort`
+- do not enable DeepSeek thinking mode by default for Claude Code traffic
+- send configured `reasoning_effort` only when thinking is enabled/requested
 - rely on DeepSeek's Anthropic-compatible `thinking` block behavior first
 - suppress or patch only if Claude Code displays incompatible reasoning content
 - do not promise Anthropic thinking-block compatibility until tested with Claude
@@ -248,6 +249,7 @@ Live DeepSeek tests after `DEEPSEEK_API_KEY` is filled:
 - non-stream simple tool-call round trip
 - streamed simple tool-call round trip
 - multi-step coding-like prompt using Claude Code against the local gateway
+- Claude Code `stream-json` output against the local gateway
 
 The live tests are not a replacement for mocked protocol tests. Mocked tests are
 the source of truth for exact Claude Code wire compatibility.

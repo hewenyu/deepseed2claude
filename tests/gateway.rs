@@ -77,6 +77,61 @@ async fn accepts_bearer_auth_for_claude_code_token_mode() {
 }
 
 #[tokio::test]
+async fn sanitizes_request_before_forwarding_to_deepseek() {
+    let upstream =
+        spawn_upstream(Router::new().route("/v1/messages", post(capture_sanitized_request))).await;
+    let app = app(Config::for_test(upstream.url()));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("x-api-key", "local-key")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "claude-opus-4-7",
+                        "max_tokens": 64,
+                        "messages": [{
+                            "role": "user",
+                            "content": [{
+                                "type": "text",
+                                "text": "hello",
+                                "citations": [],
+                                "cache_control": { "type": "ephemeral" }
+                            }]
+                        }],
+                        "metadata": {
+                            "user_id": "user-1",
+                            "trace_id": "drop-me"
+                        },
+                        "tools": [{
+                            "name": "lookup",
+                            "description": "Look up a value",
+                            "input_schema": { "type": "object" },
+                            "cache_control": { "type": "ephemeral" }
+                        }],
+                        "tool_choice": {
+                            "type": "tool",
+                            "name": "lookup",
+                            "disable_parallel_tool_use": true
+                        },
+                        "extra_unsupported_field": true
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["model"], "claude-opus-4-7");
+}
+
+#[tokio::test]
 async fn passes_streaming_sse_through() {
     let upstream =
         spawn_upstream(Router::new().route("/v1/messages", post(streaming_response))).await;
@@ -324,6 +379,40 @@ async fn capture_non_stream(headers: HeaderMap, Json(body): Json<Value>) -> Resp
         "role": "assistant",
         "content": [{ "type": "text", "text": "ok" }],
         "model": "deepseek-v4-flash",
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": { "input_tokens": 3, "output_tokens": 1 }
+    }))
+    .into_response()
+}
+
+async fn capture_sanitized_request(Json(body): Json<Value>) -> Response {
+    assert_eq!(body["model"], "deepseek-v4-pro");
+    assert_eq!(
+        body["messages"][0]["content"][0],
+        json!({ "type": "text", "text": "hello" })
+    );
+    assert_eq!(body["metadata"], json!({ "user_id": "user-1" }));
+    assert_eq!(
+        body["tools"][0],
+        json!({
+            "name": "lookup",
+            "description": "Look up a value",
+            "input_schema": { "type": "object" }
+        })
+    );
+    assert_eq!(
+        body["tool_choice"],
+        json!({ "type": "tool", "name": "lookup" })
+    );
+    assert!(body.get("extra_unsupported_field").is_none());
+
+    Json(json!({
+        "id": "msg_mock",
+        "type": "message",
+        "role": "assistant",
+        "content": [{ "type": "text", "text": "ok" }],
+        "model": "deepseek-v4-pro",
         "stop_reason": "end_turn",
         "stop_sequence": null,
         "usage": { "input_tokens": 3, "output_tokens": 1 }

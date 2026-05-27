@@ -19,6 +19,22 @@ const SUPPORTED_STOP_REASONS: &[&str] = &[
     "tool_use",
     "refusal",
 ];
+const SUPPORTED_REQUEST_FIELDS: &[&str] = &[
+    "model",
+    "max_tokens",
+    "messages",
+    "metadata",
+    "output_config",
+    "stop_sequences",
+    "stream",
+    "system",
+    "temperature",
+    "thinking",
+    "tool_choice",
+    "tools",
+    "top_p",
+];
+const IGNORED_REQUEST_FIELDS: &[&str] = &["container", "mcp_servers", "service_tier", "top_k"];
 
 pub async fn healthz() -> &'static str {
     "ok"
@@ -135,14 +151,95 @@ fn patch_request(state: &AppState, body: &mut Value) -> Result<String, Error> {
         requested_model
     };
 
-    reject_unsupported_request_content(body)?;
-
     let object = body
         .as_object_mut()
         .ok_or_else(|| Error::InvalidRequest("request body must be a JSON object".to_owned()))?;
+    normalize_request_for_deepseek(object)?;
     patch_thinking_policy(state, object);
 
     Ok(requested_model)
+}
+
+fn normalize_request_for_deepseek(object: &mut Map<String, Value>) -> Result<(), Error> {
+    strip_unsupported_request_fields(object);
+    normalize_metadata(object);
+    normalize_tools(object)?;
+    normalize_tool_choice(object)?;
+    normalize_request_content(object)
+}
+
+fn strip_unsupported_request_fields(object: &mut Map<String, Value>) {
+    object.retain(|field, _| {
+        SUPPORTED_REQUEST_FIELDS.contains(&field.as_str())
+            || IGNORED_REQUEST_FIELDS.contains(&field.as_str())
+    });
+}
+
+fn normalize_metadata(object: &mut Map<String, Value>) {
+    let Some(metadata) = object.get_mut("metadata").and_then(Value::as_object_mut) else {
+        return;
+    };
+    metadata.retain(|field, _| field == "user_id");
+    if metadata.is_empty() {
+        object.remove("metadata");
+    }
+}
+
+fn normalize_tools(object: &mut Map<String, Value>) -> Result<(), Error> {
+    let Some(tools) = object.get_mut("tools") else {
+        return Ok(());
+    };
+    let tools = tools
+        .as_array_mut()
+        .ok_or_else(|| Error::InvalidRequest("tools must be an array".to_owned()))?;
+
+    for (index, tool) in tools.iter_mut().enumerate() {
+        let tool = tool.as_object_mut().ok_or_else(|| {
+            Error::InvalidRequest(format!("tools[{index}] must be a JSON object"))
+        })?;
+        for required in ["name", "input_schema"] {
+            if !tool.contains_key(required) {
+                return Err(Error::InvalidRequest(format!(
+                    "tools[{index}].{required} is required"
+                )));
+            }
+        }
+        tool.retain(|field, _| matches!(field.as_str(), "name" | "description" | "input_schema"));
+    }
+
+    Ok(())
+}
+
+fn normalize_tool_choice(object: &mut Map<String, Value>) -> Result<(), Error> {
+    let Some(tool_choice) = object.get_mut("tool_choice") else {
+        return Ok(());
+    };
+    let tool_choice = tool_choice
+        .as_object_mut()
+        .ok_or_else(|| Error::InvalidRequest("tool_choice must be an object".to_owned()))?;
+    let choice_type = tool_choice
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::InvalidRequest("tool_choice.type is required".to_owned()))?;
+
+    match choice_type {
+        "none" | "auto" | "any" => {
+            tool_choice.retain(|field, _| field == "type");
+            Ok(())
+        }
+        "tool" => {
+            if tool_choice.get("name").and_then(Value::as_str).is_none() {
+                return Err(Error::InvalidRequest(
+                    "tool_choice.name is required when type is tool".to_owned(),
+                ));
+            }
+            tool_choice.retain(|field, _| matches!(field.as_str(), "type" | "name"));
+            Ok(())
+        }
+        unsupported => Err(Error::InvalidRequest(format!(
+            "unsupported tool_choice.type: {unsupported}"
+        ))),
+    }
 }
 
 fn patch_thinking_policy(state: &AppState, object: &mut Map<String, Value>) {
@@ -216,32 +313,51 @@ fn normalize_effort(effort: &str) -> &'static str {
     }
 }
 
-fn reject_unsupported_request_content(value: &Value) -> Result<(), Error> {
-    if let Some(system) = value.get("system") {
-        validate_content_value(system, "system")?;
+fn normalize_request_content(object: &mut Map<String, Value>) -> Result<(), Error> {
+    if let Some(system) = object.get_mut("system") {
+        normalize_content_value(system, "system")?;
     }
 
-    let messages = value
-        .get("messages")
-        .and_then(Value::as_array)
+    let messages = object
+        .get_mut("messages")
+        .and_then(Value::as_array_mut)
         .ok_or_else(|| Error::InvalidRequest("messages must be an array".to_owned()))?;
 
     for (message_index, message) in messages.iter().enumerate() {
-        let content = message.get("content").ok_or_else(|| {
+        validate_message_role(message, message_index)?;
+    }
+
+    for (message_index, message) in messages.iter_mut().enumerate() {
+        let message = message.as_object_mut().ok_or_else(|| {
+            Error::InvalidRequest(format!("messages[{message_index}] must be a JSON object"))
+        })?;
+        let content = message.get_mut("content").ok_or_else(|| {
             Error::InvalidRequest(format!("messages[{message_index}].content is required"))
         })?;
-        validate_content_value(content, &format!("messages[{message_index}].content"))?;
+        normalize_content_value(content, &format!("messages[{message_index}].content"))?;
     }
 
     Ok(())
 }
 
-fn validate_content_value(content: &Value, path: &str) -> Result<(), Error> {
+fn validate_message_role(message: &Value, index: usize) -> Result<(), Error> {
+    match message.get("role").and_then(Value::as_str) {
+        Some("user" | "assistant") => Ok(()),
+        Some(role) => Err(Error::InvalidRequest(format!(
+            "messages[{index}].role is unsupported: {role}"
+        ))),
+        None => Err(Error::InvalidRequest(format!(
+            "messages[{index}].role is required"
+        ))),
+    }
+}
+
+fn normalize_content_value(content: &mut Value, path: &str) -> Result<(), Error> {
     match content {
         Value::String(_) | Value::Null => Ok(()),
         Value::Array(blocks) => {
-            for (index, block) in blocks.iter().enumerate() {
-                validate_content_block(block, &format!("{path}[{index}]"))?;
+            for (index, block) in blocks.iter_mut().enumerate() {
+                normalize_content_block(block, &format!("{path}[{index}]"))?;
             }
             Ok(())
         }
@@ -251,17 +367,21 @@ fn validate_content_value(content: &Value, path: &str) -> Result<(), Error> {
     }
 }
 
-fn validate_content_block(block: &Value, path: &str) -> Result<(), Error> {
+fn normalize_content_block(block: &mut Value, path: &str) -> Result<(), Error> {
     let block_type = block
         .get("type")
         .and_then(Value::as_str)
+        .map(str::to_owned)
         .ok_or_else(|| Error::InvalidRequest(format!("{path}.type is required")))?;
 
-    match block_type {
-        "text" | "tool_use" | "thinking" => Ok(()),
+    match block_type.as_str() {
+        "text" => retain_block_fields(block, &["type", "text"]),
+        "tool_use" => retain_block_fields(block, &["type", "id", "name", "input"]),
+        "thinking" => retain_block_fields(block, &["type", "thinking", "signature"]),
         "tool_result" => {
-            if let Some(content) = block.get("content") {
-                validate_content_value(content, &format!("{path}.content"))?;
+            retain_block_fields(block, &["type", "tool_use_id", "content", "is_error"])?;
+            if let Some(content) = block.get_mut("content") {
+                normalize_content_value(content, &format!("{path}.content"))?;
             }
             Ok(())
         }
@@ -269,6 +389,14 @@ fn validate_content_block(block: &Value, path: &str) -> Result<(), Error> {
             "unsupported content block at {path}: {unsupported}"
         ))),
     }
+}
+
+fn retain_block_fields(block: &mut Value, supported_fields: &[&str]) -> Result<(), Error> {
+    let object = block
+        .as_object_mut()
+        .ok_or_else(|| Error::InvalidRequest("content block must be an object".to_owned()))?;
+    object.retain(|field, _| supported_fields.contains(&field.as_str()));
+    Ok(())
 }
 
 async fn normalize_message_response(
@@ -501,9 +629,7 @@ mod tests {
     use axum::response::IntoResponse;
     use serde_json::json;
 
-    use crate::anthropic::{
-        patch_message_response, patch_request, reject_unsupported_request_content,
-    };
+    use crate::anthropic::{normalize_request_content, patch_message_response, patch_request};
     use crate::{AppState, Config};
     use std::sync::Arc;
 
@@ -606,6 +732,99 @@ mod tests {
     }
 
     #[test]
+    fn patch_request_strips_unsupported_and_ignored_deepseek_fields() {
+        let state = state();
+        let mut body = json!({
+            "model": "claude-opus-4-7",
+            "max_tokens": 1024,
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "hello",
+                    "citations": [],
+                    "cache_control": { "type": "ephemeral" }
+                }]
+            }],
+            "metadata": {
+                "user_id": "user-1",
+                "trace_id": "drop-me"
+            },
+            "tools": [{
+                "name": "lookup",
+                "description": "Look up a value",
+                "input_schema": { "type": "object" },
+                "cache_control": { "type": "ephemeral" }
+            }],
+            "tool_choice": {
+                "type": "tool",
+                "name": "lookup",
+                "disable_parallel_tool_use": true
+            },
+            "container": "ignored-by-deepseek",
+            "mcp_servers": [],
+            "service_tier": "auto",
+            "top_k": 10,
+            "unknown_beta_field": true
+        });
+
+        patch_request(&state, &mut body).unwrap();
+
+        assert_eq!(body["model"], "deepseek-v4-pro");
+        assert_eq!(body["metadata"], json!({ "user_id": "user-1" }));
+        assert_eq!(
+            body["messages"][0]["content"][0],
+            json!({ "type": "text", "text": "hello" })
+        );
+        assert_eq!(
+            body["tools"][0],
+            json!({
+                "name": "lookup",
+                "description": "Look up a value",
+                "input_schema": { "type": "object" }
+            })
+        );
+        assert_eq!(
+            body["tool_choice"],
+            json!({ "type": "tool", "name": "lookup" })
+        );
+        assert!(body.get("unknown_beta_field").is_none());
+        assert!(body.get("container").is_some());
+        assert!(body.get("mcp_servers").is_some());
+        assert!(body.get("service_tier").is_some());
+        assert!(body.get("top_k").is_some());
+    }
+
+    #[test]
+    fn patch_request_rejects_unsupported_tool_choice() {
+        let state = state();
+        let mut body = json!({
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 1024,
+            "messages": [{ "role": "user", "content": "hello" }],
+            "tool_choice": { "type": "computer" }
+        });
+
+        let err = patch_request(&state, &mut body).unwrap_err();
+
+        assert!(err.to_string().contains("unsupported tool_choice.type"));
+    }
+
+    #[test]
+    fn patch_request_rejects_unsupported_message_roles() {
+        let state = state();
+        let mut body = json!({
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 1024,
+            "messages": [{ "role": "system", "content": "hello" }]
+        });
+
+        let err = patch_request(&state, &mut body).unwrap_err();
+
+        assert!(err.to_string().contains("role is unsupported"));
+    }
+
+    #[test]
     fn patch_sse_frame_echoes_requested_model_in_message_start() {
         let frame = concat!(
             "event: message_start\n",
@@ -628,7 +847,8 @@ mod tests {
             }]
         });
 
-        let err = reject_unsupported_request_content(&body).unwrap_err();
+        let mut body = body;
+        let err = normalize_request_content(body.as_object_mut().unwrap()).unwrap_err();
         assert!(err.to_string().contains("unsupported content block"));
     }
 
@@ -647,7 +867,8 @@ mod tests {
             }]
         });
 
-        reject_unsupported_request_content(&body).unwrap();
+        let mut body = body;
+        normalize_request_content(body.as_object_mut().unwrap()).unwrap();
     }
 
     #[test]

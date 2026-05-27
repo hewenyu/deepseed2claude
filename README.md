@@ -40,8 +40,17 @@ claude
 - Claude model name mapping to DeepSeek V4 models
 - upstream error normalization to Anthropic-shaped errors
 
-DeepSeek thinking is disabled by default for Claude Code compatibility. Enable it
-only after verifying the client can handle `thinking` blocks.
+DeepSeek thinking defaults to `auto`: ordinary Claude Code requests force
+thinking off so normal output is clean, while client-requested thinking or
+`--effort` can pass through to DeepSeek.
+
+Thinking policy:
+
+- `DEEPSEEK_THINKING=auto`: default; disable thinking unless the client requests
+  thinking or `output_config.effort`.
+- `DEEPSEEK_THINKING=disabled`: force thinking off for all requests.
+- `DEEPSEEK_THINKING=enabled`: enable thinking when the client does not specify
+  it.
 
 ## Verification
 

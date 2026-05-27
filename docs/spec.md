@@ -108,7 +108,7 @@ DEFAULT_DEEPSEEK_MODEL=deepseek-v4-flash
 CLAUDE_OPUS_MODEL=deepseek-v4-pro
 CLAUDE_SONNET_MODEL=deepseek-v4-flash
 CLAUDE_HAIKU_MODEL=deepseek-v4-flash
-DEEPSEEK_THINKING=disabled
+DEEPSEEK_THINKING=auto
 DEEPSEEK_REASONING_EFFORT=high
 ```
 
@@ -219,12 +219,12 @@ not normal assistant text.
 
 Default policy:
 
-- do not enable DeepSeek thinking mode by default for Claude Code traffic
-- send configured `reasoning_effort` only when thinking is enabled/requested
-- rely on DeepSeek's Anthropic-compatible `thinking` block behavior first
-- suppress or patch only if Claude Code displays incompatible reasoning content
-- do not promise Anthropic thinking-block compatibility until tested with Claude
-  Code
+- default to `auto`: ordinary Claude Code requests force thinking off, while
+  client-requested thinking or `output_config.effort` is passed through
+- support `disabled` for always-off compatibility mode
+- support `enabled` for always-on/default-on reasoning workflows
+- map unsupported effort aliases to DeepSeek-supported values
+- preserve Anthropic-compatible `thinking` blocks when the client requested them
 
 ## Acceptance Tests
 

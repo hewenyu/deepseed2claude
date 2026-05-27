@@ -140,26 +140,73 @@ fn patch_request(state: &AppState, body: &mut Value) -> Result<String, Error> {
     let object = body
         .as_object_mut()
         .ok_or_else(|| Error::InvalidRequest("request body must be a JSON object".to_owned()))?;
-    if let Some(thinking) = &state.config.deepseek_thinking {
-        if thinking == "disabled" {
-            object.insert("thinking".to_owned(), json!({ "type": thinking }));
-            object.remove("output_config");
-        } else {
-            object
-                .entry("thinking".to_owned())
-                .or_insert_with(|| json!({ "type": thinking }));
-        }
-
-        if let Some(effort) = &state.config.deepseek_reasoning_effort
-            && (thinking == "enabled" || thinking == "auto")
-        {
-            object
-                .entry("output_config".to_owned())
-                .or_insert_with(|| json!({ "effort": normalize_effort(effort) }));
-        }
-    }
+    patch_thinking_policy(state, object);
 
     Ok(requested_model)
+}
+
+fn patch_thinking_policy(state: &AppState, object: &mut Map<String, Value>) {
+    let mode = state.config.deepseek_thinking.as_deref().unwrap_or("auto");
+
+    match mode {
+        "disabled" => {
+            object.insert("thinking".to_owned(), json!({ "type": "disabled" }));
+            object.remove("output_config");
+        }
+        "enabled" => {
+            object
+                .entry("thinking".to_owned())
+                .or_insert_with(|| json!({ "type": "enabled" }));
+            ensure_output_effort(state, object);
+        }
+        "auto" => {
+            if has_client_thinking_enabled(object) {
+                ensure_output_effort(state, object);
+            } else if object.contains_key("output_config") {
+                object
+                    .entry("thinking".to_owned())
+                    .or_insert_with(|| json!({ "type": "enabled" }));
+                normalize_existing_effort(object);
+            } else {
+                object.insert("thinking".to_owned(), json!({ "type": "disabled" }));
+            }
+        }
+        _ => {
+            object.insert("thinking".to_owned(), json!({ "type": "disabled" }));
+            object.remove("output_config");
+        }
+    }
+}
+
+fn has_client_thinking_enabled(object: &Map<String, Value>) -> bool {
+    object
+        .get("thinking")
+        .and_then(Value::as_object)
+        .and_then(|thinking| thinking.get("type"))
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind == "enabled" || kind == "auto")
+}
+
+fn ensure_output_effort(state: &AppState, object: &mut Map<String, Value>) {
+    if let Some(effort) = &state.config.deepseek_reasoning_effort {
+        object
+            .entry("output_config".to_owned())
+            .or_insert_with(|| json!({ "effort": normalize_effort(effort) }));
+    }
+    normalize_existing_effort(object);
+}
+
+fn normalize_existing_effort(object: &mut Map<String, Value>) {
+    if let Some(output_config) = object
+        .get_mut("output_config")
+        .and_then(Value::as_object_mut)
+        && let Some(effort) = output_config.get("effort").and_then(Value::as_str)
+    {
+        output_config.insert(
+            "effort".to_owned(),
+            Value::String(normalize_effort(effort).to_owned()),
+        );
+    }
 }
 
 fn normalize_effort(effort: &str) -> &'static str {
@@ -506,7 +553,12 @@ mod tests {
 
     #[test]
     fn patch_request_forces_disabled_thinking_when_configured() {
-        let state = state();
+        let mut config = Config::for_test("http://upstream".to_owned());
+        config.deepseek_thinking = Some("disabled".to_owned());
+        let state = AppState {
+            config: Arc::new(config),
+            client: reqwest::Client::new(),
+        };
         let mut body = json!({
             "model": "claude-sonnet-4-5",
             "max_tokens": 1024,
@@ -519,6 +571,38 @@ mod tests {
 
         assert_eq!(body["thinking"], json!({ "type": "disabled" }));
         assert!(body.get("output_config").is_none());
+    }
+
+    #[test]
+    fn patch_request_passes_client_requested_thinking_in_auto_mode() {
+        let state = state();
+        let mut body = json!({
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 1024,
+            "thinking": { "type": "enabled" },
+            "messages": [{ "role": "user", "content": "hello" }]
+        });
+
+        patch_request(&state, &mut body).unwrap();
+
+        assert_eq!(body["thinking"], json!({ "type": "enabled" }));
+        assert_eq!(body["output_config"], json!({ "effort": "high" }));
+    }
+
+    #[test]
+    fn patch_request_enables_thinking_when_client_sends_effort_in_auto_mode() {
+        let state = state();
+        let mut body = json!({
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 1024,
+            "output_config": { "effort": "xhigh" },
+            "messages": [{ "role": "user", "content": "hello" }]
+        });
+
+        patch_request(&state, &mut body).unwrap();
+
+        assert_eq!(body["thinking"], json!({ "type": "enabled" }));
+        assert_eq!(body["output_config"], json!({ "effort": "max" }));
     }
 
     #[test]

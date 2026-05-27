@@ -49,7 +49,7 @@ impl Config {
             claude_opus_model: "deepseek-v4-pro".to_owned(),
             claude_sonnet_model: "deepseek-v4-flash".to_owned(),
             claude_haiku_model: "deepseek-v4-flash".to_owned(),
-            deepseek_thinking: Some("disabled".to_owned()),
+            deepseek_thinking: Some("auto".to_owned()),
             deepseek_reasoning_effort: Some("high".to_owned()),
         }
     }

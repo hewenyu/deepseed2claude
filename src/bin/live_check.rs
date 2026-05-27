@@ -146,11 +146,18 @@ fn with_thinking(config: &Config, mut body: Value) -> Value {
     if let Some(object) = body.as_object_mut()
         && let Some(thinking) = &config.deepseek_thinking
     {
-        object.insert("thinking".to_owned(), json!({ "type": thinking }));
-        if (thinking == "enabled" || thinking == "auto")
-            && let Some(effort) = &config.deepseek_reasoning_effort
-        {
-            object.insert("output_config".to_owned(), json!({ "effort": effort }));
+        match thinking.as_str() {
+            "enabled" => {
+                object.insert("thinking".to_owned(), json!({ "type": "enabled" }));
+                if let Some(effort) = &config.deepseek_reasoning_effort {
+                    object.insert("output_config".to_owned(), json!({ "effort": effort }));
+                }
+            }
+            "disabled" | "auto" => {
+                object.insert("thinking".to_owned(), json!({ "type": "disabled" }));
+                object.remove("output_config");
+            }
+            _ => {}
         }
     }
     body

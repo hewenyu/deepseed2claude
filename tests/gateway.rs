@@ -1,12 +1,12 @@
 use std::net::SocketAddr;
 
 use axum::body::{Body, to_bytes};
-use axum::http::header::{ACCEPT, CONTENT_TYPE};
+use axum::http::header::{ACCEPT, CONTENT_TYPE, COOKIE, SET_COOKIE};
 use axum::http::{HeaderMap, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
-use deepseed2claude::{Config, app};
+use deepseed2claude::{Config, test_app};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -16,14 +16,14 @@ use tower::ServiceExt;
 async fn forwards_patched_non_stream_request_and_echoes_client_model() {
     let upstream =
         spawn_upstream(Router::new().route("/v1/messages", post(capture_non_stream))).await;
-    let app = app(Config::for_test(upstream.url()));
+    let app = test_app(Config::for_test(upstream.url())).await.unwrap();
 
     let response = app
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/v1/messages")
-                .header("x-api-key", "local-key")
+                .header("x-api-key", "test")
                 .header("anthropic-version", "2023-06-01")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
@@ -50,14 +50,14 @@ async fn forwards_patched_non_stream_request_and_echoes_client_model() {
 async fn accepts_bearer_auth_for_claude_code_token_mode() {
     let upstream =
         spawn_upstream(Router::new().route("/v1/messages", post(capture_non_stream))).await;
-    let app = app(Config::for_test(upstream.url()));
+    let app = test_app(Config::for_test(upstream.url())).await.unwrap();
 
     let response = app
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/v1/messages")
-                .header("authorization", "Bearer local-token")
+                .header("authorization", "Bearer test")
                 .header("anthropic-version", "2023-06-01")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
@@ -80,14 +80,14 @@ async fn accepts_bearer_auth_for_claude_code_token_mode() {
 async fn sanitizes_request_before_forwarding_to_deepseek() {
     let upstream =
         spawn_upstream(Router::new().route("/v1/messages", post(capture_sanitized_request))).await;
-    let app = app(Config::for_test(upstream.url()));
+    let app = test_app(Config::for_test(upstream.url())).await.unwrap();
 
     let response = app
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/v1/messages")
-                .header("x-api-key", "local-key")
+                .header("x-api-key", "test")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     json!({
@@ -135,14 +135,14 @@ async fn sanitizes_request_before_forwarding_to_deepseek() {
 async fn passes_streaming_sse_through() {
     let upstream =
         spawn_upstream(Router::new().route("/v1/messages", post(streaming_response))).await;
-    let app = app(Config::for_test(upstream.url()));
+    let app = test_app(Config::for_test(upstream.url())).await.unwrap();
 
     let response = app
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/v1/messages")
-                .header("x-api-key", "local-key")
+                .header("x-api-key", "test")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     json!({
@@ -181,14 +181,14 @@ async fn passes_streaming_sse_through() {
 async fn forwards_count_tokens_requests() {
     let upstream =
         spawn_upstream(Router::new().route("/v1/messages/count_tokens", post(count_tokens))).await;
-    let app = app(Config::for_test(upstream.url()));
+    let app = test_app(Config::for_test(upstream.url())).await.unwrap();
 
     let response = app
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/v1/messages/count_tokens")
-                .header("x-api-key", "local-key")
+                .header("x-api-key", "test")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     json!({
@@ -209,7 +209,7 @@ async fn forwards_count_tokens_requests() {
 
 #[tokio::test]
 async fn exposes_models_endpoint() {
-    let app = app(Config::for_test("http://127.0.0.1:9".to_owned()));
+    let app = test_app(Config::for_test("http://127.0.0.1:9".to_owned())).await.unwrap();
 
     let response = app
         .oneshot(
@@ -228,17 +228,296 @@ async fn exposes_models_endpoint() {
 }
 
 #[tokio::test]
-async fn rejects_unsupported_content_before_upstream() {
+async fn admin_can_create_client_key_for_gateway_auth_immediately() {
     let upstream =
-        spawn_upstream(Router::new().route("/v1/messages", post(unexpected_upstream))).await;
-    let app = app(Config::for_test(upstream.url()));
+        spawn_upstream(Router::new().route("/v1/messages", post(capture_non_stream))).await;
+    let app = test_app(Config::for_test(upstream.url())).await.unwrap();
+
+    let login = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/admin/login")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({ "username": "admin", "password": "password" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(login.status(), StatusCode::OK);
+    let cookie = login
+        .headers()
+        .get(SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+
+    let created = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/admin/client-keys")
+                .header(COOKIE, cookie)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "name": "claude-code",
+                        "api_key": "managed-client-key",
+                        "enabled": true,
+                        "priority": 5
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
 
     let response = app
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/v1/messages")
-                .header("x-api-key", "local-key")
+                .header("x-api-key", "managed-client-key")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "claude-sonnet-4-5",
+                        "max_tokens": 64,
+                        "messages": [{ "role": "user", "content": "hello" }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn admin_adapter_changes_are_used_without_restart() {
+    async fn capture_alt_adapter(headers: HeaderMap, Json(body): Json<Value>) -> Response {
+        assert_eq!(
+            headers.get("x-api-key").unwrap().to_str().unwrap(),
+            "alt-upstream-key"
+        );
+        assert_eq!(body["model"], "deepseek-v4-pro");
+        Json(json!({
+            "id": "msg_mock",
+            "type": "message",
+            "role": "assistant",
+            "content": [{ "type": "text", "text": "ok" }],
+            "model": "deepseek-v4-pro",
+            "stop_reason": "end_turn",
+            "stop_sequence": null,
+            "usage": { "input_tokens": 3, "output_tokens": 1 }
+        }))
+        .into_response()
+    }
+
+    let upstream = spawn_upstream(Router::new().route("/v1/messages", post(capture_alt_adapter))).await;
+    let app = test_app(Config::for_test(upstream.url())).await.unwrap();
+
+    let login = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/admin/login")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({ "username": "admin", "password": "password" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let cookie = login
+        .headers()
+        .get(SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+
+    let adapter = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/admin/adapters")
+                .header(COOKIE, cookie)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "name": "Alt DeepSeek",
+                        "kind": "deepseek",
+                        "base_url_override": upstream.url(),
+                        "api_key": "alt-upstream-key",
+                        "enabled": true,
+                        "priority": 1,
+                        "default_model": "deepseek-v4-flash",
+                        "opus_model": "deepseek-v4-pro",
+                        "sonnet_model": "deepseek-v4-pro",
+                        "haiku_model": "deepseek-v4-flash",
+                        "thinking": "disabled",
+                        "reasoning_effort": "high"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(adapter.status(), StatusCode::CREATED);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("x-api-key", "test")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "claude-sonnet-4-5",
+                        "max_tokens": 64,
+                        "messages": [{ "role": "user", "content": "hello" }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn dispatches_across_multiple_adapters() {
+    let upstream =
+        spawn_upstream(Router::new().route("/v1/messages", post(capture_round_robin_adapter))).await;
+    let app = test_app(Config::for_test(upstream.url())).await.unwrap();
+
+    let login = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/admin/login")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({ "username": "admin", "password": "password" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let cookie = login
+        .headers()
+        .get(SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+
+    let adapter = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/admin/adapters")
+                .header(COOKIE, cookie)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "name": "Second DeepSeek",
+                        "kind": "deepseek",
+                        "base_url_override": upstream.url(),
+                        "api_key": "second-upstream-key",
+                        "enabled": true,
+                        "priority": 10,
+                        "default_model": "deepseek-v4-flash",
+                        "opus_model": "deepseek-v4-pro",
+                        "sonnet_model": "deepseek-v4-flash",
+                        "haiku_model": "deepseek-v4-flash",
+                        "thinking": "disabled",
+                        "reasoning_effort": "high"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(adapter.status(), StatusCode::CREATED);
+
+    let mut seen_keys = Vec::new();
+    for _ in 0..2 {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("x-api-key", "test")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "claude-sonnet-4-5",
+                            "max_tokens": 64,
+                            "messages": [{ "role": "user", "content": "hello" }]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        seen_keys.push(body["content"][0]["text"].as_str().unwrap().to_owned());
+    }
+    seen_keys.sort();
+    assert_eq!(
+        seen_keys,
+        vec![
+            "second-upstream-key".to_owned(),
+            "test-deepseek-key".to_owned()
+        ]
+    );
+}
+
+#[tokio::test]
+async fn rejects_unsupported_content_before_upstream() {
+    let upstream =
+        spawn_upstream(Router::new().route("/v1/messages", post(unexpected_upstream))).await;
+    let app = test_app(Config::for_test(upstream.url())).await.unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("x-api-key", "test")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     json!({
@@ -272,14 +551,14 @@ async fn rejects_unsupported_content_before_upstream() {
 async fn rejects_missing_messages_before_upstream() {
     let upstream =
         spawn_upstream(Router::new().route("/v1/messages", post(unexpected_upstream))).await;
-    let app = app(Config::for_test(upstream.url()));
+    let app = test_app(Config::for_test(upstream.url())).await.unwrap();
 
     let response = app
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/v1/messages")
-                .header("x-api-key", "local-key")
+                .header("x-api-key", "test")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     json!({
@@ -306,14 +585,14 @@ async fn rejects_missing_messages_before_upstream() {
 #[tokio::test]
 async fn normalizes_upstream_rate_limit_error() {
     let upstream = spawn_upstream(Router::new().route("/v1/messages", post(rate_limited))).await;
-    let app = app(Config::for_test(upstream.url()));
+    let app = test_app(Config::for_test(upstream.url())).await.unwrap();
 
     let response = app
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/v1/messages")
-                .header("x-api-key", "local-key")
+                .header("x-api-key", "test")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     json!({
@@ -336,14 +615,14 @@ async fn normalizes_upstream_rate_limit_error() {
 #[tokio::test]
 async fn normalizes_stream_upstream_errors_as_json_errors() {
     let upstream = spawn_upstream(Router::new().route("/v1/messages", post(rate_limited))).await;
-    let app = app(Config::for_test(upstream.url()));
+    let app = test_app(Config::for_test(upstream.url())).await.unwrap();
 
     let response = app
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/v1/messages")
-                .header("x-api-key", "local-key")
+                .header("x-api-key", "test")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     json!({
@@ -378,6 +657,24 @@ async fn capture_non_stream(headers: HeaderMap, Json(body): Json<Value>) -> Resp
         "type": "message",
         "role": "assistant",
         "content": [{ "type": "text", "text": "ok" }],
+        "model": "deepseek-v4-flash",
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": { "input_tokens": 3, "output_tokens": 1 }
+    }))
+    .into_response()
+}
+
+async fn capture_round_robin_adapter(headers: HeaderMap, Json(body): Json<Value>) -> Response {
+    let key = headers.get("x-api-key").unwrap().to_str().unwrap();
+    assert!(matches!(key, "test-deepseek-key" | "second-upstream-key"));
+    assert_eq!(body["model"], "deepseek-v4-flash");
+
+    Json(json!({
+        "id": "msg_mock",
+        "type": "message",
+        "role": "assistant",
+        "content": [{ "type": "text", "text": key }],
         "model": "deepseek-v4-flash",
         "stop_reason": "end_turn",
         "stop_sequence": null,

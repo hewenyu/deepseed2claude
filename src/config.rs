@@ -6,10 +6,12 @@ use crate::Error;
 #[derive(Clone, Debug)]
 pub struct Config {
     pub deepseek_api_key: String,
-    pub deepseek_base_url: String,
-    pub upstream_protocol: String,
+    pub test_deepseek_base_url: Option<String>,
     pub server_host: String,
     pub server_port: u16,
+    pub admin_username: String,
+    pub admin_password: String,
+    pub database_url: String,
     pub default_deepseek_model: String,
     pub claude_opus_model: String,
     pub claude_sonnet_model: String,
@@ -20,15 +22,17 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self, Error> {
-        let deepseek_api_key = required_env("DEEPSEEK_API_KEY")?;
+        let deepseek_api_key = optional_env("DEEPSEEK_API_KEY").unwrap_or_default();
         Ok(Self {
             deepseek_api_key,
-            deepseek_base_url: env_or("DEEPSEEK_BASE_URL", "https://api.deepseek.com/anthropic"),
-            upstream_protocol: env_or("DEEPSEEK_UPSTREAM_PROTOCOL", "anthropic"),
+            test_deepseek_base_url: None,
             server_host: env_or("SERVER_HOST", "127.0.0.1"),
             server_port: env_or("SERVER_PORT", "3000")
                 .parse()
                 .map_err(|_| Error::Config("SERVER_PORT must be a valid TCP port".to_owned()))?,
+            admin_username: required_env("ADMIN_USERNAME")?,
+            admin_password: required_env("ADMIN_PASSWORD")?,
+            database_url: env_or("DATABASE_URL", "sqlite://deepseed2claude.db"),
             default_deepseek_model: env_or("DEFAULT_DEEPSEEK_MODEL", "deepseek-v4-flash"),
             claude_opus_model: env_or("CLAUDE_OPUS_MODEL", "deepseek-v4-pro"),
             claude_sonnet_model: env_or("CLAUDE_SONNET_MODEL", "deepseek-v4-flash"),
@@ -41,10 +45,12 @@ impl Config {
     pub fn for_test(base_url: String) -> Self {
         Self {
             deepseek_api_key: "test-deepseek-key".to_owned(),
-            deepseek_base_url: base_url,
-            upstream_protocol: "anthropic".to_owned(),
+            test_deepseek_base_url: Some(base_url),
             server_host: "127.0.0.1".to_owned(),
             server_port: 0,
+            admin_username: "admin".to_owned(),
+            admin_password: "password".to_owned(),
+            database_url: "sqlite::memory:".to_owned(),
             default_deepseek_model: "deepseek-v4-flash".to_owned(),
             claude_opus_model: "deepseek-v4-pro".to_owned(),
             claude_sonnet_model: "deepseek-v4-flash".to_owned(),
@@ -61,7 +67,11 @@ impl Config {
     }
 
     pub fn messages_url(&self) -> String {
-        let base = self.deepseek_base_url.trim_end_matches('/');
+        let base = self
+            .test_deepseek_base_url
+            .as_deref()
+            .unwrap_or(crate::store::Adapter::DEEPSEEK_BASE_URL)
+            .trim_end_matches('/');
         if base.ends_with("/v1/messages") {
             base.to_owned()
         } else {

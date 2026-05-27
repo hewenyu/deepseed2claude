@@ -20,6 +20,8 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("database error: {0}")]
+    Database(#[from] sqlx::Error),
     #[error("server error: {0}")]
     Server(#[from] axum::Error),
 }
@@ -29,7 +31,11 @@ impl Error {
         match self {
             Self::InvalidRequest(_) | Self::Json(_) => "invalid_request_error",
             Self::Authentication(_) => "authentication_error",
-            Self::Upstream(_) | Self::Network(_) | Self::Io(_) | Self::Server(_) => "api_error",
+            Self::Upstream(_)
+            | Self::Network(_)
+            | Self::Io(_)
+            | Self::Database(_)
+            | Self::Server(_) => "api_error",
             Self::Config(_) => "api_error",
         }
     }
@@ -38,7 +44,11 @@ impl Error {
         match self {
             Self::InvalidRequest(_) | Self::Json(_) => StatusCode::BAD_REQUEST,
             Self::Authentication(_) => StatusCode::UNAUTHORIZED,
-            Self::Upstream(_) | Self::Network(_) | Self::Io(_) | Self::Server(_) => {
+            Self::Upstream(_)
+            | Self::Network(_)
+            | Self::Io(_)
+            | Self::Database(_)
+            | Self::Server(_) => {
                 StatusCode::BAD_GATEWAY
             }
             Self::Config(_) => StatusCode::INTERNAL_SERVER_ERROR,

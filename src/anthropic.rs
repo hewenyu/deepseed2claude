@@ -10,6 +10,7 @@ use serde_json::{Map, Value, json};
 use tracing::{debug, warn};
 
 use crate::error::anthropic_error_response;
+use crate::store::UpstreamSelection;
 use crate::{AppState, Error, upstream};
 
 const SUPPORTED_STOP_REASONS: &[&str] = &[
@@ -40,19 +41,42 @@ pub async fn healthz() -> &'static str {
     "ok"
 }
 
-pub async fn models(State(state): State<AppState>) -> Json<Value> {
-    Json(json!({
-        "data": [
-            model("claude-opus-4-1", "Claude Opus mapped to DeepSeek V4 Pro"),
-            model("claude-sonnet-4-5", "Claude Sonnet mapped to DeepSeek V4 Flash"),
-            model("claude-3-5-haiku", "Claude Haiku mapped to DeepSeek V4 Flash"),
-            model("deepseek-v4-pro", "DeepSeek V4 Pro"),
-            model("deepseek-v4-flash", "DeepSeek V4 Flash")
-        ],
+pub async fn models(State(state): State<AppState>) -> Result<Json<Value>, Error> {
+    let admin_state = state.store.admin_state().await?;
+    let mut models = vec![
+        model("claude-opus-4-1", "Claude Opus mapped by active ADP"),
+        model("claude-sonnet-4-5", "Claude Sonnet mapped by active ADP"),
+        model("claude-3-5-haiku", "Claude Haiku mapped by active ADP"),
+    ];
+    for adapter in admin_state.adapters.iter().filter(|adapter| adapter.enabled) {
+        for id in [
+            adapter.default_model.as_str(),
+            adapter.opus_model.as_str(),
+            adapter.sonnet_model.as_str(),
+            adapter.haiku_model.as_str(),
+        ] {
+            if !models.iter().any(|model| model["id"] == id) {
+                models.push(model(id, &format!("{} upstream model", adapter.name)));
+            }
+        }
+    }
+    let first_id = models
+        .first()
+        .and_then(|model| model.get("id"))
+        .cloned()
+        .unwrap_or_else(|| json!("claude-opus-4-1"));
+    let last_id = models
+        .last()
+        .and_then(|model| model.get("id"))
+        .cloned()
+        .unwrap_or_else(|| json!("claude-3-5-haiku"));
+
+    Ok(Json(json!({
+        "data": models,
         "has_more": false,
-        "first_id": "claude-opus-4-1",
-        "last_id": state.config.default_deepseek_model
-    }))
+        "first_id": first_id,
+        "last_id": last_id
+    })))
 }
 
 pub async fn messages(
@@ -60,16 +84,17 @@ pub async fn messages(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Error> {
-    require_client_auth(&headers)?;
+    require_client_auth(&state, &headers).await?;
 
     let mut request_body: Value = serde_json::from_slice(&body)?;
-    let requested_model = patch_request(&state, &mut request_body)?;
+    let selection = state.store.select_upstream(state.next_dispatch_slot()).await?;
+    let requested_model = patch_request(&selection, &mut request_body)?;
     let is_stream = request_body
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
-    let upstream_response = upstream::send_messages(&state, &headers, request_body).await?;
+    let upstream_response = upstream::send_messages(&state, &selection, &headers, request_body).await?;
 
     if !upstream_response.status().is_success() {
         return Ok(normalize_upstream_error(upstream_response).await);
@@ -87,12 +112,14 @@ pub async fn count_tokens(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Error> {
-    require_client_auth(&headers)?;
+    require_client_auth(&state, &headers).await?;
 
     let mut request_body: Value = serde_json::from_slice(&body)?;
-    patch_request(&state, &mut request_body)?;
+    let selection = state.store.select_upstream(state.next_dispatch_slot()).await?;
+    patch_request(&selection, &mut request_body)?;
 
-    let upstream_response = upstream::send_count_tokens(&state, &headers, request_body).await?;
+    let upstream_response =
+        upstream::send_count_tokens(&state, &selection, &headers, request_body).await?;
     if !upstream_response.status().is_success() {
         return Ok(normalize_upstream_error(upstream_response).await);
     }
@@ -108,28 +135,37 @@ fn model(id: &str, display_name: &str) -> Value {
     })
 }
 
-fn require_client_auth(headers: &HeaderMap) -> Result<(), Error> {
-    let has_x_api_key = headers
+async fn require_client_auth(state: &AppState, headers: &HeaderMap) -> Result<(), Error> {
+    let api_key = headers
         .get("x-api-key")
         .and_then(|value| value.to_str().ok())
-        .map(|value| !value.trim().is_empty())
-        .unwrap_or(false);
-    let has_bearer = headers
-        .get("authorization")
-        .and_then(|value| value.to_str().ok())
-        .map(|value| value.trim().to_ascii_lowercase().starts_with("bearer "))
-        .unwrap_or(false);
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.trim().strip_prefix("Bearer "))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        });
 
-    if has_x_api_key || has_bearer {
+    let Some(api_key) = api_key else {
+        return Err(Error::Authentication(
+            "missing x-api-key or authorization bearer token".to_owned(),
+        ));
+    };
+
+    if state.store.authenticate_client_key(&api_key).await? {
         Ok(())
     } else {
-        Err(Error::Authentication(
-            "missing x-api-key or authorization bearer token".to_owned(),
-        ))
+        Err(Error::Authentication("invalid client API key".to_owned()))
     }
 }
 
-fn patch_request(state: &AppState, body: &mut Value) -> Result<String, Error> {
+fn patch_request(selection: &UpstreamSelection, body: &mut Value) -> Result<String, Error> {
     let requested_model = {
         let object = body.as_object_mut().ok_or_else(|| {
             Error::InvalidRequest("request body must be a JSON object".to_owned())
@@ -140,7 +176,7 @@ fn patch_request(state: &AppState, body: &mut Value) -> Result<String, Error> {
             .and_then(Value::as_str)
             .ok_or_else(|| Error::InvalidRequest("model is required".to_owned()))?
             .to_owned();
-        let upstream_model = state.config.map_model(&requested_model);
+        let upstream_model = selection.adapter.map_model(&requested_model);
         object.insert("model".to_owned(), Value::String(upstream_model.clone()));
 
         if !object.contains_key("messages") {
@@ -155,7 +191,7 @@ fn patch_request(state: &AppState, body: &mut Value) -> Result<String, Error> {
         .as_object_mut()
         .ok_or_else(|| Error::InvalidRequest("request body must be a JSON object".to_owned()))?;
     normalize_request_for_deepseek(object)?;
-    patch_thinking_policy(state, object);
+    patch_thinking_policy(selection, object);
 
     Ok(requested_model)
 }
@@ -242,8 +278,8 @@ fn normalize_tool_choice(object: &mut Map<String, Value>) -> Result<(), Error> {
     }
 }
 
-fn patch_thinking_policy(state: &AppState, object: &mut Map<String, Value>) {
-    let mode = state.config.deepseek_thinking.as_deref().unwrap_or("auto");
+fn patch_thinking_policy(selection: &UpstreamSelection, object: &mut Map<String, Value>) {
+    let mode = selection.adapter.thinking.as_deref().unwrap_or("auto");
 
     match mode {
         "disabled" => {
@@ -254,11 +290,11 @@ fn patch_thinking_policy(state: &AppState, object: &mut Map<String, Value>) {
             object
                 .entry("thinking".to_owned())
                 .or_insert_with(|| json!({ "type": "enabled" }));
-            ensure_output_effort(state, object);
+            ensure_output_effort(selection, object);
         }
         "auto" => {
             if has_client_thinking_enabled(object) {
-                ensure_output_effort(state, object);
+                ensure_output_effort(selection, object);
             } else if object.contains_key("output_config") {
                 object
                     .entry("thinking".to_owned())
@@ -284,8 +320,8 @@ fn has_client_thinking_enabled(object: &Map<String, Value>) -> bool {
         .is_some_and(|kind| kind == "enabled" || kind == "auto")
 }
 
-fn ensure_output_effort(state: &AppState, object: &mut Map<String, Value>) {
-    if let Some(effort) = &state.config.deepseek_reasoning_effort {
+fn ensure_output_effort(selection: &UpstreamSelection, object: &mut Map<String, Value>) {
+    if let Some(effort) = &selection.adapter.reasoning_effort {
         object
             .entry("output_config".to_owned())
             .or_insert_with(|| json!({ "effort": normalize_effort(effort) }));
@@ -630,26 +666,38 @@ mod tests {
     use serde_json::json;
 
     use crate::anthropic::{normalize_request_content, patch_message_response, patch_request};
-    use crate::{AppState, Config};
-    use std::sync::Arc;
+    use crate::store::{Adapter, UpstreamSelection};
 
-    fn state() -> AppState {
-        AppState {
-            config: Arc::new(Config::for_test("http://upstream".to_owned())),
-            client: reqwest::Client::new(),
+    fn selection() -> UpstreamSelection {
+        UpstreamSelection {
+            adapter: Adapter {
+                id: 1,
+                name: "DeepSeek".to_owned(),
+                kind: "deepseek".to_owned(),
+                base_url_override: None,
+                api_key: "test-deepseek-key".to_owned(),
+                enabled: true,
+                priority: 10,
+                default_model: "deepseek-v4-flash".to_owned(),
+                opus_model: "deepseek-v4-pro".to_owned(),
+                sonnet_model: "deepseek-v4-flash".to_owned(),
+                haiku_model: "deepseek-v4-flash".to_owned(),
+                thinking: Some("auto".to_owned()),
+                reasoning_effort: Some("high".to_owned()),
+            },
         }
     }
 
     #[test]
     fn patch_request_maps_model_and_disables_thinking_by_default() {
-        let state = state();
+        let selection = selection();
         let mut body = json!({
             "model": "claude-sonnet-4-5",
             "max_tokens": 1024,
             "messages": [{ "role": "user", "content": "hello" }]
         });
 
-        let requested = patch_request(&state, &mut body).unwrap();
+        let requested = patch_request(&selection, &mut body).unwrap();
 
         assert_eq!(requested, "claude-sonnet-4-5");
         assert_eq!(body["model"], "deepseek-v4-flash");
@@ -659,19 +707,15 @@ mod tests {
 
     #[test]
     fn patch_request_can_enable_thinking_when_configured() {
-        let mut config = Config::for_test("http://upstream".to_owned());
-        config.deepseek_thinking = Some("enabled".to_owned());
-        let state = AppState {
-            config: Arc::new(config),
-            client: reqwest::Client::new(),
-        };
+        let mut selection = selection();
+        selection.adapter.thinking = Some("enabled".to_owned());
         let mut body = json!({
             "model": "claude-sonnet-4-5",
             "max_tokens": 1024,
             "messages": [{ "role": "user", "content": "hello" }]
         });
 
-        patch_request(&state, &mut body).unwrap();
+        patch_request(&selection, &mut body).unwrap();
 
         assert_eq!(body["thinking"], json!({ "type": "enabled" }));
         assert_eq!(body["output_config"], json!({ "effort": "high" }));
@@ -679,12 +723,8 @@ mod tests {
 
     #[test]
     fn patch_request_forces_disabled_thinking_when_configured() {
-        let mut config = Config::for_test("http://upstream".to_owned());
-        config.deepseek_thinking = Some("disabled".to_owned());
-        let state = AppState {
-            config: Arc::new(config),
-            client: reqwest::Client::new(),
-        };
+        let mut selection = selection();
+        selection.adapter.thinking = Some("disabled".to_owned());
         let mut body = json!({
             "model": "claude-sonnet-4-5",
             "max_tokens": 1024,
@@ -693,7 +733,7 @@ mod tests {
             "messages": [{ "role": "user", "content": "hello" }]
         });
 
-        patch_request(&state, &mut body).unwrap();
+        patch_request(&selection, &mut body).unwrap();
 
         assert_eq!(body["thinking"], json!({ "type": "disabled" }));
         assert!(body.get("output_config").is_none());
@@ -701,7 +741,7 @@ mod tests {
 
     #[test]
     fn patch_request_passes_client_requested_thinking_in_auto_mode() {
-        let state = state();
+        let selection = selection();
         let mut body = json!({
             "model": "claude-sonnet-4-5",
             "max_tokens": 1024,
@@ -709,7 +749,7 @@ mod tests {
             "messages": [{ "role": "user", "content": "hello" }]
         });
 
-        patch_request(&state, &mut body).unwrap();
+        patch_request(&selection, &mut body).unwrap();
 
         assert_eq!(body["thinking"], json!({ "type": "enabled" }));
         assert_eq!(body["output_config"], json!({ "effort": "high" }));
@@ -717,7 +757,7 @@ mod tests {
 
     #[test]
     fn patch_request_enables_thinking_when_client_sends_effort_in_auto_mode() {
-        let state = state();
+        let selection = selection();
         let mut body = json!({
             "model": "claude-sonnet-4-5",
             "max_tokens": 1024,
@@ -725,7 +765,7 @@ mod tests {
             "messages": [{ "role": "user", "content": "hello" }]
         });
 
-        patch_request(&state, &mut body).unwrap();
+        patch_request(&selection, &mut body).unwrap();
 
         assert_eq!(body["thinking"], json!({ "type": "enabled" }));
         assert_eq!(body["output_config"], json!({ "effort": "max" }));
@@ -733,7 +773,7 @@ mod tests {
 
     #[test]
     fn patch_request_strips_unsupported_and_ignored_deepseek_fields() {
-        let state = state();
+        let selection = selection();
         let mut body = json!({
             "model": "claude-opus-4-7",
             "max_tokens": 1024,
@@ -768,7 +808,7 @@ mod tests {
             "unknown_beta_field": true
         });
 
-        patch_request(&state, &mut body).unwrap();
+        patch_request(&selection, &mut body).unwrap();
 
         assert_eq!(body["model"], "deepseek-v4-pro");
         assert_eq!(body["metadata"], json!({ "user_id": "user-1" }));
@@ -797,7 +837,7 @@ mod tests {
 
     #[test]
     fn patch_request_rejects_unsupported_tool_choice() {
-        let state = state();
+        let selection = selection();
         let mut body = json!({
             "model": "claude-sonnet-4-5",
             "max_tokens": 1024,
@@ -805,21 +845,21 @@ mod tests {
             "tool_choice": { "type": "computer" }
         });
 
-        let err = patch_request(&state, &mut body).unwrap_err();
+        let err = patch_request(&selection, &mut body).unwrap_err();
 
         assert!(err.to_string().contains("unsupported tool_choice.type"));
     }
 
     #[test]
     fn patch_request_rejects_unsupported_message_roles() {
-        let state = state();
+        let selection = selection();
         let mut body = json!({
             "model": "claude-sonnet-4-5",
             "max_tokens": 1024,
             "messages": [{ "role": "system", "content": "hello" }]
         });
 
-        let err = patch_request(&state, &mut body).unwrap_err();
+        let err = patch_request(&selection, &mut body).unwrap_err();
 
         assert!(err.to_string().contains("role is unsupported"));
     }
